@@ -6,24 +6,23 @@ import tempfile
 from io import BytesIO
 
 import uvicorn
+import whisper
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
-from faster_whisper import WhisperModel
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
-COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
 
 app = FastAPI()
 
-model: WhisperModel = None
+model: whisper.Whisper = None
 model_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
 async def load_model():
     global model
-    model = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print(f"Loaded model={WHISPER_MODEL} device={DEVICE} compute_type={COMPUTE_TYPE}")
+    model = whisper.load_model(WHISPER_MODEL, device=DEVICE)
+    print(f"Loaded model={WHISPER_MODEL} device={DEVICE}")
 
 
 @app.get("/health")
@@ -32,7 +31,6 @@ async def health():
         "status": "ok",
         "model": WHISPER_MODEL,
         "device": DEVICE,
-        "compute_type": COMPUTE_TYPE,
     }
 
 
@@ -43,29 +41,29 @@ async def transcribe(
     task: str = Form("transcribe"),
 ):
     audio_bytes = await file.read()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "audio.wav")[1] or ".wav")
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(audio_bytes)
         tmp.flush()
         tmp.close()
 
         async with model_lock:
-            segments_iter, info = model.transcribe(
-                tmp.name,
-                language=language,
-                task=task,
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: model.transcribe(tmp.name, language=language, task=task),
             )
-            segments = [
-                {"start": seg.start, "end": seg.end, "text": seg.text}
-                for seg in segments_iter
-            ]
 
-        full_text = " ".join(s["text"].strip() for s in segments)
+        segments = [
+            {"start": s["start"], "end": s["end"], "text": s["text"]}
+            for s in result.get("segments", [])
+        ]
+        duration = segments[-1]["end"] if segments else 0.0
         return {
-            "text": full_text,
-            "language": info.language,
-            "language_probability": info.language_probability,
-            "duration": info.duration,
+            "text": result["text"].strip(),
+            "language": result.get("language"),
+            "language_probability": None,
+            "duration": duration,
             "segments": segments,
         }
     finally:
@@ -81,7 +79,7 @@ async def websocket_transcribe(websocket: WebSocket):
         audio_buffer.seek(0)
         audio_bytes = audio_buffer.read()
         if not audio_bytes:
-            return [], None
+            return [], None, None
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         try:
@@ -90,12 +88,16 @@ async def websocket_transcribe(websocket: WebSocket):
             tmp.close()
 
             async with model_lock:
-                segments_iter, info = model.transcribe(tmp.name)
-                segments = [
-                    {"start": seg.start, "end": seg.end, "text": seg.text}
-                    for seg in segments_iter
-                ]
-            return segments, info
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: model.transcribe(tmp.name),
+                )
+
+            segments = [
+                {"start": s["start"], "end": s["end"], "text": s["text"]}
+                for s in result.get("segments", [])
+            ]
+            return segments, result.get("language"), result["text"].strip()
         finally:
             os.unlink(tmp.name)
 
@@ -115,7 +117,7 @@ async def websocket_transcribe(websocket: WebSocket):
                 action = data.get("action")
 
                 if action in ("transcribe", "end"):
-                    segments, info = await run_transcription()
+                    segments, language, full_text = await run_transcription()
 
                     for seg in segments:
                         await websocket.send_text(json.dumps({
@@ -125,14 +127,12 @@ async def websocket_transcribe(websocket: WebSocket):
                             "text": seg["text"],
                         }))
 
-                    full_text = " ".join(s["text"].strip() for s in segments)
                     await websocket.send_text(json.dumps({
                         "type": "done",
-                        "text": full_text,
-                        "language": info.language if info else None,
+                        "text": full_text or "",
+                        "language": language,
                     }))
 
-                    # Reset buffer for next cycle
                     audio_buffer = BytesIO()
 
                     if action == "end":

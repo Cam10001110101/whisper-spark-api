@@ -1,4 +1,5 @@
-faster-whisper
+openai-whisper
+torch
 fastapi
 uvicorn[standard]
 python-multipart

@@ -1,13 +1,13 @@
-FROM nvidia/cuda:12.3.0-cudnn9-runtime-ubuntu22.04
+FROM nvcr.io/nvidia/pytorch:25.09-py3
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip ffmpeg \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 
